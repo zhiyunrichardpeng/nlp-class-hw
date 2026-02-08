@@ -79,7 +79,7 @@ zero marks.
 
 The default model file `data/chunker.pt` can be downloaded from here:
 
-https://drive.google.com/file/d/1Cob8vewgpvNhJ2KnZlYq2Tntkgc0l2yx/view
+https://drive.google.com/file/d/1OY_NKo0vxS2ndttdfpqGyMo0PubbhIK3/view
 
 ## Data files
 
