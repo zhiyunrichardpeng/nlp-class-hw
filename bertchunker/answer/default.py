@@ -7,6 +7,7 @@ from transformers import AutoTokenizer, AutoModel
 import tqdm
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+FROZEN_ENCODER_POLICY = 'frozen-base-v1'
 
 def read_conll(handle, input_idx=0, label_idx=2):
     conll_data = []
@@ -51,16 +52,26 @@ class TransformerModel(nn.Module):
 
     def init_model_from_scratch(self, basemodel, tagset_size, lr):
         self.encoder = AutoModel.from_pretrained(basemodel)
+        # Keep the pretrained BERT weights fixed throughout this homework.
+        self.encoder.requires_grad_(False)
+        self.encoder.eval()
         self.encoder_hidden_dim = self.encoder.config.hidden_size
         self.classification_head = nn.Linear(self.encoder_hidden_dim, tagset_size)
         # TODO initialize self.crf_layer in here as well.
-        # TODO modify the optimizers in a way that each model part is optimized with a proper learning rate!
+        # Include any added trainable task-specific layers in the optimizer;
+        # the pretrained encoder must remain frozen.
         self.optimizers = [
             optim.Adam(
-                list(self.encoder.parameters()) + list(self.classification_head.parameters()),
+                self.classification_head.parameters(),
                 lr=lr
             )
         ]
+
+    def train(self, mode=True):
+        super().train(mode)
+        # Disable encoder dropout even while the task-specific layers train.
+        self.encoder.eval()
+        return self
 
     def forward(self, sentence_input):
         encoded = self.encoder(sentence_input).last_hidden_state
@@ -186,8 +197,7 @@ class FinetuneTagger:
                 total_loss += loss.item()
                 loss_count += 1
                 loss.backward()
-                # TODO you may want to freeze the BERT encoder for a couple of epochs
-                #   and then start performing full fine-tuning.
+                # Update the task-specific layers only; do not unfreeze BERT.
                 for optimizer in self.model.optimizers:
                     optimizer.step()
                 # HINT: getting the value of loss below 2.0 might mean your model is moving in the right direction!
@@ -201,6 +211,8 @@ class FinetuneTagger:
             savefile = self.modelfile + epoch_str + self.modelsuffix
             print(f"Saving model file: {savefile}", file=sys.stderr)
             torch.save({
+                        'encoder_training_policy': FROZEN_ENCODER_POLICY,
+                        'basemodel': self.basemodel,
                         'epoch': epoch,
                         'model_state_dict': self.model.state_dict(),
                         'optimizer_state_dict': self.model.optimizers[0].state_dict(),
@@ -209,11 +221,26 @@ class FinetuneTagger:
                         'ix_to_tag': self.ix_to_tag,
                     }, savefile)
 
-    def model_str(self):
+    def load_checkpoint(self):
         if not os.path.isfile(self.modelfile + self.modelsuffix):
             raise IOError(f"Error: missing model file {self.modelfile + self.modelsuffix}")
 
-        saved_model = torch.load(self.modelfile + self.modelsuffix)
+        saved_model = torch.load(self.modelfile + self.modelsuffix, map_location=device)
+        if (not isinstance(saved_model, dict)
+                or saved_model.get('encoder_training_policy') != FROZEN_ENCODER_POLICY
+                or saved_model.get('basemodel') != self.basemodel):
+            raise ValueError(
+                "This checkpoint is not marked as a frozen-encoder baseline for "
+                f"{self.basemodel}. Older/downloaded checkpoints may contain updated "
+                "BERT weights and cannot be made compliant merely by freezing them "
+                "after loading. Back up or rename the old checkpoint, then run the "
+                "current program with -f to train a fresh frozen-encoder model. "
+                "In the baseline notebook, run chunker.train() before decoding."
+            )
+        return saved_model
+
+    def model_str(self):
+        saved_model = self.load_checkpoint()
         tag_to_ix = saved_model['tag_to_ix']
         ix_to_tag = saved_model['ix_to_tag']
         model = TransformerModel(self.basemodel, len(tag_to_ix), lr=self.lr).to(device)
@@ -228,10 +255,7 @@ class FinetuneTagger:
             with open(inputfile, 'r') as f:
                 input_data = read_conll(f, input_idx=0, label_idx=-1)
 
-        if not os.path.isfile(self.modelfile + self.modelsuffix):
-            raise IOError(f"Error: missing model file {self.modelfile + self.modelsuffix}")
-
-        saved_model = torch.load(self.modelfile + self.modelsuffix)
+        saved_model = self.load_checkpoint()
         self.tag_to_ix = saved_model['tag_to_ix']
         self.ix_to_tag = saved_model['ix_to_tag']
         model = TransformerModel(self.basemodel, len(self.tag_to_ix), lr=self.lr).to(device)
@@ -264,7 +288,7 @@ if __name__ == '__main__':
     argparser.add_argument("-b", "--batchsize", dest="batchsize", type=int, default=16,
                             help="batch size [default: 16]")
     argparser.add_argument("-r", "--lr", dest="lr", type=float, default=5e-5,
-                            help="the learning rate used to finetune the BERT-like encoder module.")
+                            help="the learning rate for trainable task-specific layers; BERT stays frozen.")
     argparser.add_argument("-f", "--force", dest="force", action="store_true", default=False,
                             help="force training phase (warning: can be slow)")
     argparser.add_argument("-l", "--logfile", dest="logfile", default=None,
